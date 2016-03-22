@@ -2,6 +2,7 @@ package common
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
@@ -39,45 +40,63 @@ func (s *StepCreateTags) Run(state multistep.StateBag) multistep.StepAction {
 				Region:      aws.String(region),
 			})
 
-			// Retrieve image list for given AMI
-			imageResp, err := regionconn.DescribeImages(&ec2.DescribeImagesInput{
-				ImageIds: resourceIds,
-			})
+			attempts := 0
+			max_retries := 60
+			sleep_between_retries := 5
+			for attempts < max_retries {
+				ui.Say(fmt.Sprintf("Testing fix for DescribeImages (%s) attempt %d...", ami, attempts))
+				// Retrieve image list for given AMI
+				imageResp, err := regionconn.DescribeImages(&ec2.DescribeImagesInput{
+					ImageIds: resourceIds,
+				})
 
-			if err != nil {
-				err := fmt.Errorf("Error retrieving details for AMI (%s): %s", ami, err)
-				state.Put("error", err)
-				ui.Error(err.Error())
-				return multistep.ActionHalt
-			}
-
-			if len(imageResp.Images) == 0 {
-				err := fmt.Errorf("Error retrieving details for AMI (%s), no images found", ami)
-				state.Put("error", err)
-				ui.Error(err.Error())
-				return multistep.ActionHalt
-			}
-
-			image := imageResp.Images[0]
-
-			// Add only those with a Snapshot ID, i.e. not Ephemeral
-			for _, device := range image.BlockDeviceMappings {
-				if device.Ebs != nil && device.Ebs.SnapshotId != nil {
-					ui.Say(fmt.Sprintf("Tagging snapshot: %s", *device.Ebs.SnapshotId))
-					resourceIds = append(resourceIds, device.Ebs.SnapshotId)
+				if err != nil {
+					err := fmt.Errorf("Error retrieving details for AMI (%s): %s, attempt %d", ami, err, attempts)
+					state.Put("error", err)
+					ui.Error(err.Error())
+					if attempts == max_retries - 1 {
+						return multistep.ActionHalt
+					}
 				}
-			}
 
-			_, err = regionconn.CreateTags(&ec2.CreateTagsInput{
-				Resources: resourceIds,
-				Tags:      ec2Tags,
-			})
+				if len(imageResp.Images) == 0 {
+					err := fmt.Errorf("Error retrieving details for AMI (%s), no images found, attempt %d", ami, attempts)
+					state.Put("error", err)
+					ui.Error(err.Error())
+					if attempts == max_retries - 1 {
+						return multistep.ActionHalt
+					}
+				}
+				image := imageResp.Images[0]
 
-			if err != nil {
-				err := fmt.Errorf("Error adding tags to Resources (%#v): %s", resourceIds, err)
-				state.Put("error", err)
-				ui.Error(err.Error())
-				return multistep.ActionHalt
+				if err == nil && len(imageResp.Images) != 0 {
+				// Add only those with a Snapshot ID, i.e. not Ephemeral
+					for _, device := range image.BlockDeviceMappings {
+						if device.Ebs != nil && device.Ebs.SnapshotId != nil {
+							ui.Say(fmt.Sprintf("Tagging snapshot: %s", *device.Ebs.SnapshotId))
+							resourceIds = append(resourceIds, device.Ebs.SnapshotId)
+						}
+					}
+
+					_, err = regionconn.CreateTags(&ec2.CreateTagsInput{
+						Resources: resourceIds,
+						Tags:      ec2Tags,
+					})
+
+					if err != nil {
+						err := fmt.Errorf("Error adding tags to Resources (%#v): %s, attempt %d", resourceIds, err, attempts)
+						state.Put("error", err)
+						ui.Error(err.Error())
+						if attempts == max_retries - 1 {
+							return multistep.ActionHalt
+						}
+					} else {
+					   break
+					}
+				}
+
+				attempts += 1
+				time.Sleep(time.Duration(sleep_between_retries) * time.Second)
 			}
 		}
 	}
